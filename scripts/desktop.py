@@ -2,6 +2,8 @@
 import argparse
 from collections import deque
 import hashlib
+import importlib.metadata
+import inspect
 import json
 from pathlib import Path
 import subprocess
@@ -30,31 +32,104 @@ def local_url(value):
     return value
 
 
-def desktop_evidence(url):
+class ConnectionProblem(RuntimeError):
+    def __init__(self, code, message, action):
+        super().__init__(message)
+        self.code = code
+        self.action = action
+
+
+def dependency_check():
+    if sys.version_info < (3, 10):
+        raise ConnectionProblem('PYTHON_UNSUPPORTED', '需要 Python 3.10 或更新版本',
+                                '使用满足要求的现有Python解释器；不要自动安装')
+    try:
+        from websockets.sync.client import connect
+        version = importlib.metadata.version('websockets')
+    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
+        raise ConnectionProblem('WEBSOCKETS_MISSING', '当前解释器缺少websockets同步客户端',
+                                '使用已安装依赖的解释器，或先征得依赖安装授权') from error
+    required = {'proxy', 'ping_interval', 'close_timeout', 'max_size'}
+    if not required.issubset(inspect.signature(connect).parameters):
+        raise ConnectionProblem('WEBSOCKETS_INCOMPATIBLE', 'websockets连接接口不兼容',
+                                '核对已安装版本与当前接口，不在项目任务中临时升级依赖')
+    return {'python': sys.version.split()[0], 'websockets': version}
+
+
+def inspect_desktop(url):
     port = urlparse(local_url(url)).port
     script = (
         "$p=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath);"
         f"$c=@(Get-NetTCPConnection -RemotePort {port} -State Established -ErrorAction SilentlyContinue | "
         "Where-Object {$_.RemoteAddress -eq '127.0.0.1'} | Select-Object OwningProcess);"
-        "@{processes=$p;connections=$c}|ConvertTo-Json -Depth 4 -Compress"
+        f"$l=@(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | "
+        "Select-Object LocalAddress,OwningProcess);"
+        "@{processes=$p;connections=$c;listeners=$l}|ConvertTo-Json -Depth 4 -Compress"
     )
     out = subprocess.run(['powershell.exe', '-NoProfile', '-Command', script],
-                         capture_output=True, text=True, check=True)
-    data = json.loads(out.stdout)
+                         capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(out.stdout)
+
+
+def desktop_evidence(url):
+    data = inspect_desktop(url)
     processes = {p['ProcessId']: p for p in data['processes']}
+    desktops = {pid for pid, p in processes.items()
+                if p['Name'].lower() in ('chatgpt.exe', 'codexdesktop.exe')
+                and 'codex' in (p.get('ExecutablePath') or '').lower()}
     for connection in data['connections']:
         pid = connection['OwningProcess']
         seen = set()
         current = pid
         while current in processes and current not in seen:
             seen.add(current)
-            p = processes[current]
-            # codex.exe通常是后端，不能仅凭它有连接认定桌面已连。
-            if (p['Name'].lower() in ('chatgpt.exe', 'codexdesktop.exe')
-                    and 'codex' in (p.get('ExecutablePath') or '').lower()):
+            if current in desktops:
                 return {'desktopPid': current, 'connectionPid': pid, 'url': url}
-            current = p['ParentProcessId']
-    raise RuntimeError('未核实Codex桌面进程到共享端口的实际连接；不发送项目任务')
+            current = processes[current]['ParentProcessId']
+    if not desktops:
+        raise ConnectionProblem('DESKTOP_NOT_RUNNING', '未核实Codex桌面进程',
+                                '先启动共享后端，再经授权启动桌面；此时不发送任务')
+    raise ConnectionProblem('DESKTOP_NOT_SHARED', '未核实Codex桌面到共享端口的实际连接',
+                            '桌面可能使用独立后端或尚未连上；保存工作后正常重连，不强杀')
+
+
+def connection_report(url):
+    local_url(url)
+    checks = []
+    try:
+        dependencies = dependency_check()
+        checks.append({'check': 'dependencies', 'ok': True, **dependencies})
+    except ConnectionProblem as error:
+        checks.append({'check': 'dependencies', 'ok': False, 'code': error.code,
+                       'message': str(error), 'action': error.action})
+    try:
+        evidence = desktop_evidence(url)
+        checks.append({'check': 'desktop', 'ok': True, **evidence})
+    except Exception as error:
+        checks.append({'check': 'desktop', 'ok': False,
+                       'code': getattr(error, 'code', 'DESKTOP_INSPECTION_FAILED'),
+                       'message': str(error),
+                       'action': getattr(error, 'action', '核对Windows进程与TCP检查权限')})
+    if checks[0]['ok']:
+        rpc = None
+        try:
+            rpc = Rpc(url)
+            checks.append({'check': 'backend', 'ok': True})
+        except Exception as error:
+            code = 'BACKEND_UNAVAILABLE' if isinstance(error, OSError) else 'BACKEND_PROTOCOL_FAILED'
+            checks.append({'check': 'backend', 'ok': False, 'code': code,
+                           'message': str(error),
+                           'action': '核对共享后端监听/当前协议；不要改用独立CLI或重复派单'})
+        finally:
+            if rpc:
+                rpc.close()
+    else:
+        checks.append({'check': 'backend', 'ok': False, 'code': 'DEPENDENCY_BLOCKED',
+                       'action': '依赖未满足，不尝试后端连接'})
+    ready = all(check['ok'] for check in checks)
+    return {'status': 'connected' if ready else 'blocked', 'ready': ready,
+            'url': url, 'checks': checks}
+
 
 
 def final_message(turn):
@@ -167,6 +242,21 @@ def check_resume(thread, manifest, project):
         raise RuntimeError('上次调用结果未核实，先recover')
 
 
+def session_policy(data, project, mode):
+    expected = {'read-only': 'readOnly', 'workspace-write': 'workspaceWrite'}[mode]
+    sandbox = data.get('sandbox', {})
+    roots = sandbox.get('writableRoots', [])
+    if (data.get('approvalPolicy') != 'on-request'
+            or data.get('approvalsReviewer') != 'user'
+            or sandbox.get('type') != expected
+            or sandbox.get('networkAccess', False) is not False
+            or str(Path(data.get('cwd', '')).resolve()).casefold() != str(project).casefold()
+            or any(str(Path(root).resolve()).casefold() != str(project).casefold() for root in roots)):
+        raise RuntimeError('会话实际权限/审批/项目与请求不符，不发送项目消息；核对当前Schema与配置')
+    return {'approvalPolicy': data['approvalPolicy'], 'approvalsReviewer': data['approvalsReviewer'],
+            'sandboxType': sandbox['type'], 'cwd': data['cwd']}
+
+
 def result_for(turn):
     return {'status': turn.get('status', 'unknown'), 'error': turn.get('error'),
             'finalMessage': final_message(turn)}
@@ -178,6 +268,7 @@ def send(args):
     prompt = Path(args.prompt).read_text(encoding='utf-8')
     if not project.is_dir() or not prompt.strip():
         raise ValueError('项目目录不存在或任务消息为空')
+    dependency_check()
     evidence = desktop_evidence(args.url)
     task.mkdir(parents=True, exist_ok=True)
     manifest_path = task / 'task.json'
@@ -197,14 +288,17 @@ def send(args):
         rpc = Rpc(args.url, run=run, thread=manifest.get('threadId'))
         if manifest:
             check_resume(rpc.read_thread(), manifest, project)
-            rpc.call('thread/resume', {'threadId': rpc.thread})
+            data = rpc.call('thread/resume', {'threadId': rpc.thread})
         else:
             data = rpc.call('thread/start', {'cwd': str(project), 'sandbox': args.mode,
-                                            'approvalPolicy': 'on-request'})
+                                            'approvalPolicy': 'on-request',
+                                            'approvalsReviewer': 'user'})
             rpc.thread = data['thread']['id']
             manifest = {'project': str(project), 'mode': args.mode, 'url': args.url,
-                        'threadId': rpc.thread}
+                        'threadId': rpc.thread, 'phase': 'ready', 'run': str(run)}
+            write_json(manifest_path, manifest)
             # 同一连接创建和启动；无rollout的新会话不能跨连接resume。
+        manifest['effectivePolicy'] = session_policy(data, project, args.mode)
         manifest.pop('turnId', None)
         manifest.update({'phase': 'starting', 'run': str(run), 'desktopEvidence': evidence})
         write_json(manifest_path, manifest)
@@ -280,6 +374,8 @@ def main():
     sub = p.add_subparsers(dest='command', required=True)
     d = sub.add_parser('doctor')
     d.add_argument('--url', default='ws://127.0.0.1:18765')
+    backend = sub.add_parser('backend')
+    backend.add_argument('--url', default='ws://127.0.0.1:18765')
     server = sub.add_parser('serve')
     server.add_argument('--codex', required=True)
     server.add_argument('--url', default='ws://127.0.0.1:18765')
@@ -302,11 +398,16 @@ def main():
         subprocess.run([str(exe), '-c', 'analytics.enabled=false', '-c',
                         'features.code_mode_host=true', 'app-server', '--listen',
                         local_url(args.url)], check=True)
-    elif args.command == 'doctor':
-        evidence = desktop_evidence(args.url)
+    elif args.command == 'backend':
+        dependencies = dependency_check()
         rpc = Rpc(args.url)
         rpc.close()
-        print(json.dumps({'status': 'connected', **evidence}))
+        print(json.dumps({'status': 'backendReady', **dependencies}))
+    elif args.command == 'doctor':
+        report = connection_report(args.url)
+        print(json.dumps(report, ensure_ascii=False))
+        if not report['ready']:
+            raise SystemExit(1)
     elif args.command == 'send':
         send(args)
     elif args.command == 'recover':

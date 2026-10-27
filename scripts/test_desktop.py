@@ -6,10 +6,13 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+# 无论调用方是否传-B，都不向skill目录写入导入缓存。
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('desktop', Path(__file__).with_name('desktop.py'))
 desktop = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(desktop)
@@ -24,14 +27,19 @@ class FakeRpc:
     wait_status = 'completed'
     thread_turns = []
     project = ''
+    approval_policy = 'on-request'
+    reviewer = 'user'
+    sandbox_type = 'workspaceWrite'
 
     def __init__(self, url, run=None, thread=None):
         self.thread = thread
 
     def call(self, method, params):
         self.calls.append((method, params))
-        if method == 'thread/start':
-            return {'thread': {'id': 'task-thread'}}
+        if method in ('thread/start', 'thread/resume'):
+            return {'thread': {'id': 'task-thread'}, 'cwd': self.project,
+                    'approvalPolicy': self.approval_policy, 'approvalsReviewer': self.reviewer,
+                    'sandbox': {'type': self.sandbox_type, 'networkAccess': False}}
         if method == 'turn/start':
             if self.fail_start:
                 raise ConnectionError('lost response')
@@ -65,6 +73,12 @@ class WorkflowTests(unittest.TestCase):
         FakeRpc.wait_status = 'completed'
         FakeRpc.thread_turns = []
         FakeRpc.project = str(self.project)
+        FakeRpc.approval_policy = 'on-request'
+        FakeRpc.reviewer = 'user'
+        FakeRpc.sandbox_type = 'workspaceWrite'
+        self.dependencies = patch.object(desktop, 'dependency_check',
+                                         return_value={'python': 'test', 'websockets': 'test'})
+        self.dependencies.start()
         self.rpc = patch.object(desktop, 'Rpc', FakeRpc)
         self.evidence = patch.object(desktop, 'desktop_evidence', return_value={'desktopPid': 123})
         self.rpc.start()
@@ -73,6 +87,7 @@ class WorkflowTests(unittest.TestCase):
     def tearDown(self):
         self.rpc.stop()
         self.evidence.stop()
+        self.dependencies.stop()
         self.tmp.cleanup()
 
     def manifest(self):
@@ -233,6 +248,95 @@ class WorkflowTests(unittest.TestCase):
         desktop.recover(self.args)
         self.assertEqual(self.manifest()['phase'], 'unknown')
         self.assertNotIn('turnId', self.manifest())
+
+    def test_missing_dependency_blocks_backend_probe(self):
+        error = desktop.ConnectionProblem('WEBSOCKETS_MISSING', 'missing', 'install after approval')
+        with patch.object(desktop, 'dependency_check', side_effect=error):
+            report = desktop.connection_report('ws://127.0.0.1:18765')
+        self.assertFalse(report['ready'])
+        self.assertEqual(report['checks'][0]['code'], 'WEBSOCKETS_MISSING')
+        self.assertEqual(report['checks'][-1]['code'], 'DEPENDENCY_BLOCKED')
+        self.assertEqual(FakeRpc.calls, [])
+
+    def test_report_separates_backend_from_desktop(self):
+        with patch.object(desktop, 'Rpc', side_effect=ConnectionRefusedError('not listening')):
+            report = desktop.connection_report('ws://127.0.0.1:18765')
+        self.assertFalse(report['ready'])
+        self.assertTrue(report['checks'][1]['ok'])
+        self.assertEqual(report['checks'][2]['code'], 'BACKEND_UNAVAILABLE')
+
+    def test_report_ready_only_when_all_checks_pass(self):
+        report = desktop.connection_report('ws://127.0.0.1:18765')
+        self.assertTrue(report['ready'])
+        self.assertTrue(all(check['ok'] for check in report['checks']))
+
+    def test_standalone_desktop_has_specific_diagnosis(self):
+        data = {'processes': [{'ProcessId': 10, 'ParentProcessId': 1, 'Name': 'ChatGPT.exe',
+                              'ExecutablePath': 'C:/apps/OpenAI.Codex/app/ChatGPT.exe'}],
+                'connections': []}
+        with patch.object(desktop.subprocess, 'run', return_value=SimpleNamespace(stdout=json.dumps(data))):
+            with self.assertRaises(desktop.ConnectionProblem) as failure:
+                real_desktop_evidence('ws://127.0.0.1:18765')
+        self.assertEqual(failure.exception.code, 'DESKTOP_NOT_SHARED')
+
+    def test_desktop_absent_has_specific_diagnosis(self):
+        data = {'processes': [], 'connections': []}
+        with patch.object(desktop.subprocess, 'run', return_value=SimpleNamespace(stdout=json.dumps(data))):
+            with self.assertRaises(desktop.ConnectionProblem) as failure:
+                real_desktop_evidence('ws://127.0.0.1:18765')
+        self.assertEqual(failure.exception.code, 'DESKTOP_NOT_RUNNING')
+
+    def test_actual_never_policy_prevents_project_message(self):
+        FakeRpc.approval_policy = 'never'
+        with self.assertRaisesRegex(RuntimeError, '实际权限'):
+            desktop.send(self.args)
+        self.assertNotIn('turn/start', [c[0] for c in FakeRpc.calls])
+
+    def test_automatic_reviewer_prevents_project_message(self):
+        FakeRpc.reviewer = 'auto_review'
+        with self.assertRaisesRegex(RuntimeError, '实际权限'):
+            desktop.send(self.args)
+        self.assertNotIn('turn/start', [c[0] for c in FakeRpc.calls])
+
+    def test_sandbox_mismatch_prevents_project_message(self):
+        FakeRpc.sandbox_type = 'dangerFullAccess'
+        with self.assertRaisesRegex(RuntimeError, '实际权限'):
+            desktop.send(self.args)
+        self.assertNotIn('turn/start', [c[0] for c in FakeRpc.calls])
+
+    def test_resume_checks_effective_policy_again(self):
+        desktop.send(self.args)
+        FakeRpc.calls = []
+        FakeRpc.approval_policy = 'never'
+        with self.assertRaisesRegex(RuntimeError, '实际权限'):
+            desktop.send(self.args)
+        self.assertEqual([c[0] for c in FakeRpc.calls], ['thread/resume'])
+
+    def test_rpc_disables_periodic_ping_without_changing_permissions(self):
+        sent = []
+        options = {}
+        closed = []
+        ws = SimpleNamespace(send=sent.append,
+                             recv=lambda **kw: json.dumps({'id': 1, 'result': {'userAgent': 'test'}}))
+
+        class Context:
+            def __enter__(self):
+                return ws
+
+            def __exit__(self, *args):
+                closed.append(True)
+
+        def connect(url, **kwargs):
+            options.update(kwargs)
+            return Context()
+
+        with patch.dict(sys.modules, {'websockets.sync.client': SimpleNamespace(connect=connect)}):
+            rpc = RealRpc('ws://127.0.0.1:18765')
+            rpc.close()
+        self.assertIsNone(options['ping_interval'])
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(json.loads(sent[0])['method'], 'initialize')
+        self.assertEqual(json.loads(sent[1])['method'], 'initialized')
 
     def test_unknown_approval_fail_closed(self):
         rpc = object.__new__(RealRpc)

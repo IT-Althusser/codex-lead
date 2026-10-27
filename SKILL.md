@@ -12,4 +12,4 @@ $ARGUMENTS
 
 先读取本 skill 目录的 `WORKFLOW.md`，完整遵循其中流程。调度细节按需读取 `references/desktop.md`，任务消息使用 `references/prompts.md`。
 
-只使用 `/codex-lead` 这一入口。流程、模板和工具均维护在本目录，不创建别名或独立 CLI 备用流程。
+执行流程：确认需求 → 调用 Codex 桌面实施 → mentor 独立审查 → 不合格返工 → 验收交付。提交或推送仅按用户要求执行。

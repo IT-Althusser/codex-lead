@@ -1,6 +1,6 @@
 # 桌面调度手册（仅mentor读取，不粘贴给Codex）
 
-工具根目录是本 skill 的 `scripts/`。Python统一 `python -X utf8 -I -B`，使用本机已有 `websockets`，不自动安装。无需读取或复制Codex认证文件。工具只在Windows本机回环WebSocket工作，不提供独立CLI实施后备方案。
+工具根目录是本 skill 的 `scripts/`。Python统一 `python -X utf8 -I -B`，要求Python 3.10+及同一解释器已有兼容的 `websockets` 同步客户端，不自动安装。先按 [连接检查表](connection-checklist.md)完成执行前检查；无需读取或复制Codex认证文件。工具只在Windows本机回环WebSocket工作，不提供独立CLI实施后备方案。
 
 ## 1. 先检查，后派单
 
@@ -8,7 +8,7 @@
 python -X utf8 -I -B <skill>/scripts/desktop.py doctor
 ```
 
-doctor同时检查initialize与实际TCP连接，桌面根进程（或其子进程）必须连到相同端口。仅app-server运行不通过。进程路径/版本随安装变动，禁止把上次exe哈希路径复制成固定配置。
+doctor一次检查解释器依赖、initialize与实际TCP连接，输出各检查的ok/code/action及总ready；仅ready=true通过。桌面根进程（或其子进程）必须连到相同端口，仅app-server运行不通过。进程路径/版本随安装变动，不使用固定exe哈希路径。独立`backend`子命令仅确认依赖/后端，不能替代doctor。
 
 这只能证明**共享后端**，不能证明GUI正在展示指定会话。首次任务启动记录threadId后，让用户在桌面打开对应任务，确认可以看到任务消息/工具过程；未确认前只说“共享会话已建立”，不能声称用户已经看见。必要时用桌面会话标题/记录ID定位，不选择“最近一条”代替任务映射。已有任务恢复只核对原ID，不每回合询问可见性。
 
@@ -24,7 +24,7 @@ python -X utf8 -I -B <skill>/scripts/desktop.py serve --codex <已核实的桌�
 powershell.exe -NoProfile -File <skill>/scripts/launch_desktop.ps1
 ```
 
-已经运行而需要重连时，先请用户保存工作，获准后才加 `-Restart`。脚本会识别托盘隐藏的进程；正常关闭不成功则请用户在托盘“退出”，不强杀、不反复重启。启动后再次doctor，不能以启动返回PID当作连接成功。
+已经运行而需要重连时，先请用户保存工作，获准后才加 `-Restart`。脚本先运行backend检查依赖/协议，未就绪不关闭桌面；识别托盘隐藏进程，正常关闭不成功就请用户完全退出，不强杀或反复重启。启动后在有界时间内用doctor等待实际共享连接，未连接返回失败且不自动再启实例。可用`-Python`指定已有解释器、`-ConnectTimeout`调整1..120秒等待；等待不是修改审批权限。
 
 内存压力停止后台任务时不诊断为代码失败，不自动重启；用户要求恢复后检查资源、原turn和磁盘内容。不要为避免中断修改全局环境或关闭保护。不要把本手册的排障过程写进项目任务消息。
 
@@ -40,7 +40,7 @@ python -X utf8 -I -B <skill>/scripts/desktop.py send \
   --mode workspace-write
 ```
 
-调查用read-only。send首次在同一连接thread/start+turn/start，避免未持久化rollout的resume错误；后续自动读取该task的准确threadId，先检查原状态，再resume订阅后发送。不改任务源码、不写固定threadId、不手动递增v2/v3文件名。
+调查用read-only。send首次在同一连接thread/start+turn/start，避免未持久化rollout的resume错误；后续自动读取该task的准确threadId，先检查原状态，再resume订阅后发送。启动/恢复响应必须证明实际on-request、user审批、所选沙箱与项目目录，且没有额外写目录或全局网络放行，否则拒绝发送项目消息。检查不是只相信启动参数。不改任务源码、不写固定threadId、不手动递增结果版本号。
 
 工具不会隐式把只读任务升为写权限：若用户批准实施后需切换模式，核实协议策略并建立关联的实施task/session，保留原调查记录，不修改现有task.json绕过检查。可继续在同一个桌面项目中显示两个明确名称的阶段会话。
 
@@ -60,7 +60,7 @@ python -X utf8 -I -B <skill>/scripts/desktop.py watch --run <send输出的run目
 
 ## 3. 审批：逐请求，不自动授权
 
-工具已按本机0.164协议验证commandExecution和fileChange两类`decision`结构；桌面升级变更时先核对当前生成Schema，不猜新接口。其他请求（权限扩展、登录、用户输入工具等）默认不授予，报告不支持，不换执行者绕过。
+工具支持commandExecution和fileChange两类`decision`审批结构；接口兼容性按当前桌面版本与Schema核对，不猜新接口。其他请求（权限扩展、登录、用户输入工具等）默认不授予，报告不支持，不换执行者绕过。
 
 每个待审批请求生成`approval-<digest>.json`，绑定thread、turn及完整请求。mentor读请求，向用户呈现准确command/cwd/原因或文件变更，取得**该请求的真实决定**后，才用Write写请求中指定的decisionFile：
 
@@ -93,9 +93,15 @@ python -X utf8 -I -B <skill>/scripts/desktop.py recover --task <原task目录>
 
 ## 5. 工具验证边界
 
-```bash
-python -X utf8 -I -B <skill>/scripts/test_desktop.py --tmp-root D:/codex-content/<当天日期>/codex-lead-validation
+在skill仓库根目录的PowerShell中执行：
+
+```powershell
+$testRoot = Join-Path (Join-Path 'D:\codex-content' (Get-Date -Format 'yyyy-MM-dd')) 'codex-lead-validation'
+python -X utf8 -I -B scripts/test_desktop.py --tmp-root $testRoot -v
+powershell.exe -NoProfile -File scripts/test_launch_desktop.ps1 -TmpRoot $testRoot
 ```
+
+`--tmp-root`为必填，`-B`及脚本内字节码设置避免生成缓存。启动脚本回归使用模拟进程/连接，不实际关闭或启动桌面。
 
 离线测试只验证状态机、消息不被技术前缀污染、按次审批、回合去重、参数和记录隔离，不发真实模型请求，不修改项目、不重启桌面。doctor是可另行执行的只读真实连接检查。模拟测试通过不等于所有GUI版本/审批/进程崩溃场景均端到端认证。
 
