@@ -48,15 +48,9 @@ python -X utf8 -I -B <skill>/scripts/desktop.py send \
 
 工具保留最后回合结果，不做GUI自动化，也不读取桌面应用内部凭据/数据库。历史日志可能含命令路径，按用户敏感信息规则处理；不要复制整个机器状态给Codex。
 
-### 自动跟进
+### 停止与继续
 
-使用后台Bash执行send（完成通知是主信号），并启动Monitor监听该次run：
-
-```bash
-python -X utf8 -I -B <skill>/scripts/desktop.py watch --run <send输出的run目录> --seconds 1750
-```
-
-只读取首个turn_started用于取得run不属于轮询。watch在审批、结果、恢复结果或dispatch错误时发信号，未知/失败也能出现。Monitor期满而主任务仍运行时只续订监听，不重新派单。正常情况下不频繁read或发送“继续”。后台进程退出且无结果时检查stderr和recover，不把无通知当成功。
+`send` 成功返回 `turn_started` 后即结束本轮。不得启动 `watch`、后台 monitor、通知订阅或其他轮询，也不得自动调用 `recover`。向用户说明任务已发送，并等待用户明确发送“继续”。收到“继续”后，才读取原 task 的准确 thread/turn 状态；每次再次发送消息后都立即停止等待。`watch` 仅供用户明确要求检查进度时手动使用。
 
 ## 3. 审批：逐请求，不自动授权
 

@@ -93,24 +93,36 @@ class WorkflowTests(unittest.TestCase):
     def manifest(self):
         return json.loads((Path(self.args.task) / 'task.json').read_text(encoding='utf-8'))
 
+    def mark_previous_turn_recovered(self):
+        manifest = self.manifest()
+        manifest['phase'] = 'completed'
+        desktop.write_json(Path(self.args.task) / 'task.json', manifest)
+        FakeRpc.thread_turns = [{'id': manifest['turnId'], 'status': 'completed', 'items': []}]
+
     def test_new_session_same_connection_and_clean_prompt(self):
         desktop.send(self.args)
         self.assertEqual([c[0] for c in FakeRpc.calls], ['thread/start', 'turn/start'])
         sent = FakeRpc.calls[-1][1]['input'][0]['text']
         self.assertEqual(sent, self.prompt.read_text(encoding='utf-8'))
         self.assertNotIn('desktopPid', sent)
-        self.assertEqual(self.manifest()['phase'], 'completed')
+        self.assertEqual(self.manifest()['phase'], 'running')
+        self.assertFalse((Path(self.manifest()['run']) / 'result.json').exists())
         self.assertFalse((Path(self.args.task) / 'dispatch.lock').exists())
 
     def test_followup_uses_exact_thread_and_new_run(self):
         desktop.send(self.args)
         first = self.manifest()['run']
+        self.mark_previous_turn_recovered()
         FakeRpc.calls = []
         desktop.send(self.args)
         self.assertEqual([c[0] for c in FakeRpc.calls], ['thread/resume', 'turn/start'])
-        self.assertEqual(FakeRpc.calls[0][1], {'threadId': 'task-thread'})
+        self.assertEqual(FakeRpc.calls[0][1], {
+            'threadId': 'task-thread', 'cwd': str(self.project),
+            'sandbox': 'workspace-write', 'approvalPolicy': 'on-request',
+            'approvalsReviewer': 'user',
+        })
         self.assertNotEqual(self.manifest()['run'], first)
-        self.assertTrue((Path(first) / 'result.json').exists())
+        self.assertFalse((Path(first) / 'result.json').exists())
 
     def test_running_turn_prevents_duplicate(self):
         desktop.send(self.args)
@@ -132,11 +144,10 @@ class WorkflowTests(unittest.TestCase):
             desktop.send(self.args)
         self.assertEqual(FakeRpc.calls, [])
 
-    def test_failed_turn_not_success(self):
-        FakeRpc.wait_status = 'failed'
-        with self.assertRaisesRegex(RuntimeError, '未正常完成'):
+    def test_send_does_not_wait_for_turn_completion(self):
+        with patch.object(FakeRpc, 'wait', side_effect=AssertionError('send must return immediately')):
             desktop.send(self.args)
-        self.assertEqual(self.manifest()['phase'], 'failed')
+        self.assertEqual(self.manifest()['phase'], 'running')
 
     def test_mode_change_not_implicit(self):
         desktop.send(self.args)
@@ -211,6 +222,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(found['desktopPid'], 10)
         self.assertEqual(found['connectionPid'], 11)
 
+    def test_desktop_inspection_uses_utf8_for_unicode_paths(self):
+        data = {'processes': [{'ExecutablePath': 'D:/项目/桌面/ChatGPT.exe'}],
+                'connections': [], 'listeners': []}
+        with patch.object(desktop.subprocess, 'run',
+                          return_value=SimpleNamespace(stdout=json.dumps(data, ensure_ascii=False))) as run:
+            found = desktop.inspect_desktop('ws://127.0.0.1:18765')
+        self.assertEqual(found, data)
+        self.assertEqual(run.call_args.kwargs['encoding'], 'utf-8')
+        self.assertIn('[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);',
+                      run.call_args.args[0][-1])
+
     def test_backend_connection_is_not_desktop(self):
         data = {'processes': [{'ProcessId': 11, 'ParentProcessId': 1, 'Name': 'codex.exe',
                               'ExecutablePath': 'C:/bin/codex.exe'}],
@@ -241,6 +263,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_lost_turn_start_cannot_recover_as_previous_turn(self):
         desktop.send(self.args)
+        self.mark_previous_turn_recovered()
         FakeRpc.fail_start = True
         with self.assertRaises(ConnectionError):
             desktop.send(self.args)
@@ -306,6 +329,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_resume_checks_effective_policy_again(self):
         desktop.send(self.args)
+        self.mark_previous_turn_recovered()
         FakeRpc.calls = []
         FakeRpc.approval_policy = 'never'
         with self.assertRaisesRegex(RuntimeError, '实际权限'):

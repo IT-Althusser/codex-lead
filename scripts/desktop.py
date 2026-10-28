@@ -59,6 +59,7 @@ def dependency_check():
 def inspect_desktop(url):
     port = urlparse(local_url(url)).port
     script = (
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
         "$p=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath);"
         f"$c=@(Get-NetTCPConnection -RemotePort {port} -State Established -ErrorAction SilentlyContinue | "
         "Where-Object {$_.RemoteAddress -eq '127.0.0.1'} | Select-Object OwningProcess);"
@@ -67,7 +68,7 @@ def inspect_desktop(url):
         "@{processes=$p;connections=$c;listeners=$l}|ConvertTo-Json -Depth 4 -Compress"
     )
     out = subprocess.run(['powershell.exe', '-NoProfile', '-Command', script],
-                         capture_output=True, text=True, check=True, timeout=30)
+                         capture_output=True, text=True, encoding='utf-8', check=True, timeout=30)
     return json.loads(out.stdout)
 
 
@@ -288,7 +289,9 @@ def send(args):
         rpc = Rpc(args.url, run=run, thread=manifest.get('threadId'))
         if manifest:
             check_resume(rpc.read_thread(), manifest, project)
-            data = rpc.call('thread/resume', {'threadId': rpc.thread})
+            data = rpc.call('thread/resume', {'threadId': rpc.thread, 'cwd': str(project),
+                                             'sandbox': args.mode, 'approvalPolicy': 'on-request',
+                                             'approvalsReviewer': 'user'})
         else:
             data = rpc.call('thread/start', {'cwd': str(project), 'sandbox': args.mode,
                                             'approvalPolicy': 'on-request',
@@ -309,13 +312,7 @@ def send(args):
         write_json(run / 'state.json', manifest)
         print(json.dumps({'event': 'turn_started', 'run': str(run),
                           'threadId': rpc.thread, 'turnId': manifest['turnId']}), flush=True)
-        turn = rpc.wait(manifest['turnId'], args.wait)
-        result = result_for(turn)
-        write_json(run / 'result.json', result)
-        manifest['phase'] = result['status'] if result['status'] in TERMINAL else 'unknown'
-        write_json(manifest_path, manifest)
-        if result['status'] != 'completed' or result['error']:
-            raise RuntimeError('目标回合未正常完成，检查result.json')
+        # 仅负责发送；状态读取和后续处理必须由用户明确“继续”后触发。
     except Exception as error:
         write_json(run / 'dispatch-error.json', {'status': 'unknown', 'error': str(error)})
         if manifest.get('phase') in ('starting', 'running'):
@@ -384,7 +381,6 @@ def main():
     for name in ('task', 'project', 'prompt'):
         s.add_argument('--' + name, required=True)
     s.add_argument('--mode', choices=('read-only', 'workspace-write'), required=True)
-    s.add_argument('--wait', type=int, default=36000)
     r = sub.add_parser('recover')
     r.add_argument('--task', required=True)
     w = sub.add_parser('watch')
